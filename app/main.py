@@ -18,6 +18,7 @@ from app.tools import build_registry
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
+
 class Settings(BaseSettings):
     openai_api_key: str = ""
     anthropic_api_key: str = ""
@@ -39,6 +40,7 @@ def get_settings() -> Settings:
 
 
 # ─── Pydantic Models ─────────────────────────────────────────────────────────
+
 
 class ToolResult(BaseModel):
     tool_call_id: str
@@ -110,12 +112,14 @@ class BatchEnergyRequest(BaseModel):
 
 # ─── Chart Service ────────────────────────────────────────────────────────────
 
+
 class ChartService:
     async def generate_chart(self, data: dict) -> dict:
         return await asyncio.to_thread(self._generate_sync, data)
 
     def _generate_sync(self, data: dict) -> dict:
         import matplotlib
+
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
@@ -145,20 +149,32 @@ class ChartService:
                 for i, series in enumerate(y_values):
                     label = labels[i] if labels and i < len(labels) else f"Series {i+1}"
                     ax.plot(
-                        x_values, series, marker="o",
-                        color=colors[i % len(colors)], label=label,
-                        linewidth=2, markersize=4,
+                        x_values,
+                        series,
+                        marker="o",
+                        color=colors[i % len(colors)],
+                        label=label,
+                        linewidth=2,
+                        markersize=4,
                     )
                 ax.legend(facecolor="#1a1a2e", edgecolor="#444", labelcolor="white")
             else:
                 ax.plot(
-                    x_values, y_values, marker="o",
-                    color=colors[0], linewidth=2, markersize=4,
+                    x_values,
+                    y_values,
+                    marker="o",
+                    color=colors[0],
+                    linewidth=2,
+                    markersize=4,
                 )
         elif chart_type == "bar":
-            ax.bar(x_values, y_values, color=colors[0], edgecolor="white", linewidth=0.5)
+            ax.bar(
+                x_values, y_values, color=colors[0], edgecolor="white", linewidth=0.5
+            )
         elif chart_type == "scatter":
-            ax.scatter(x_values, y_values, c=colors[0], s=50, edgecolor="white", linewidth=0.5)
+            ax.scatter(
+                x_values, y_values, c=colors[0], s=50, edgecolor="white", linewidth=0.5
+            )
 
         if title:
             ax.set_title(title, fontsize=14, fontweight="bold", pad=10)
@@ -293,9 +309,7 @@ async def calculate_energy_batch(request: Request, body: BatchEnergyRequest):
         raise HTTPException(status_code=400, detail="No frames provided")
     try:
         service = _get_mace(request)
-        frames_data = [
-            [a.model_dump() for a in frame] for frame in body.frames
-        ]
+        frames_data = [[a.model_dump() for a in frame] for frame in body.frames]
         return await service.calculate_energy_batch(
             frames_data=frames_data,
             model_id=body.model,
@@ -336,6 +350,7 @@ async def generate_chart(body: dict):
 
 
 # ─── App Factory ──────────────────────────────────────────────────────────────
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
