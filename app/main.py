@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     max_sessions: int = 500
     session_ttl: int = 3600
     mace_device: str = ""
+    mace_compile_mode: str = ""  # "default", "reduce-overhead", or "max-autotune"
     cors_origins: list[str] = ["*"]
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
@@ -203,8 +204,10 @@ _mace_service: MACEService | None = None
 def _get_mace(request: Request) -> MACEService:
     global _mace_service
     if _mace_service is None:
-        device = request.app.state.settings.mace_device
-        _mace_service = MACEService(device=device)
+        s = request.app.state.settings
+        _mace_service = MACEService(
+            device=s.mace_device, compile_mode=s.mace_compile_mode
+        )
     return _mace_service
 
 
@@ -284,6 +287,15 @@ async def test_mace(request: Request):
         return await service.test()
     except Exception as e:
         return {"error": str(e), "traceback": traceback.format_exc()}
+
+
+@mace_router.get("/device-info")
+async def mace_device_info(request: Request):
+    try:
+        service = _get_mace(request)
+        return service.device_info()
+    except Exception as e:
+        return {"error": str(e)}
 
 
 @mace_router.post("/optimize")

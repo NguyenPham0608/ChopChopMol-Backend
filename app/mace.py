@@ -1,27 +1,33 @@
 import asyncio
+import logging
 from typing import Any
 
 import numpy as np
 
+log = logging.getLogger(__name__)
 
-def _get_torch_device() -> str:
+
+def _detect_device() -> tuple[str, str]:
+    """Auto-detect best available device and matching dtype.
+
+    Returns (device, dtype):
+      - cuda  → float64  (full precision, fast on GPU)
+      - mps   → float32  (Apple Silicon; no float64 support in Metal)
+      - cpu   → float64  (fallback)
+    """
     try:
         import torch
 
         if torch.cuda.is_available():
-            return "cuda"
+            log.info("CUDA available — using GPU: %s", torch.cuda.get_device_name(0))
+            return "cuda", "float64"
         if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            return "mps"
+            log.info("Apple Silicon MPS available — using GPU with float32")
+            return "mps", "float32"
     except ImportError:
         pass
-    return "cpu"
-
-
-def _detect_mace_device() -> tuple[str, str]:
-    device = _get_torch_device()
-    mace_device = "cpu" if device == "mps" else device
-    mace_dtype = "float64" if mace_device != "mps" else "float32"
-    return mace_device, mace_dtype
+    log.info("No GPU detected — using CPU")
+    return "cpu", "float64"
 
 MACE_MODELS = {
     "mace-mp-0a": {"url": "medium", "name": "MACE-MP-0a"},
@@ -38,30 +44,113 @@ MACE_MODELS = {
 MODEL_MAP = {"small": "small", "medium": "medium", "large": "large", "mace-mpa-0": "medium"}
 
 
+def _patch_mps_double(calc) -> None:
+    """Monkey-patch ScaleShiftMACE models so .double() → .float() on MPS.
+
+    MACE's forward pass calls `tensor.double()` for numerical precision in
+    per-atom energy decomposition (models.py:580).  MPS does not support
+    float64, so we swap .double() for .float() inside the forward method.
+    Total energy and forces are unaffected — they never touch .double().
+    """
+    import types, torch
+    from mace.modules.models import ScaleShiftMACE
+
+    for model in calc.models:
+        if not isinstance(model, ScaleShiftMACE):
+            continue
+        orig_forward = model.forward
+
+        def _patched_forward(*args, _orig=orig_forward, **kwargs):
+            # Temporarily make .double() return .float() for MPS tensors
+            _real_double = torch.Tensor.double
+            torch.Tensor.double = lambda self, *a, **kw: self.float()
+            try:
+                return _orig(*args, **kwargs)
+            finally:
+                torch.Tensor.double = _real_double
+
+        model.forward = types.MethodType(lambda self, *a, _pf=_patched_forward, **kw: _pf(*a, **kw), model)
+    log.info("Patched ScaleShiftMACE .double()→.float() for MPS compatibility")
+
+
 class MACEService:
     """Manages lazy-loaded MACE calculators and runs computations in threads."""
 
-    def __init__(self, device: str = ""):
+    def __init__(self, device: str = "", compile_mode: str = ""):
         self._calculators: dict[str, Any] = {}
-        mace_device, mace_dtype = _detect_mace_device()
-        self.device = device or mace_device
-        self.dtype = mace_dtype
+        detected_device, detected_dtype = _detect_device()
+        self.device = device or detected_device
+        self.dtype = "float32" if self.device == "mps" else detected_dtype
+        self.compile_mode = compile_mode or None  # "" → None (disabled)
+        log.info(
+            "MACEService initialised — device=%s  dtype=%s  compile_mode=%s",
+            self.device, self.dtype, self.compile_mode or "off",
+        )
+
+    def _load_calculator(self, *, model: str, dtype: str):
+        """Load a MACE calculator, handling MPS float64→float32 conversion."""
+        from mace.calculators import mace_mp
+
+        if self.device == "mps":
+            # MPS cannot handle float64 tensors — load on CPU then transfer.
+            # MACE's ScaleShiftMACE.forward() also hardcodes .double() for
+            # per-atom energy; we monkey-patch that to .float() on MPS.
+            calc = mace_mp(model=model, default_dtype="float32", device="cpu")
+            import torch
+            for m in calc.models:
+                m.float().to(torch.device("mps"))
+            calc.device = "mps"
+            _patch_mps_double(calc)
+            return calc
+
+        try:
+            return mace_mp(
+                model=model,
+                default_dtype=dtype,
+                device=self.device,
+                compile_mode=self.compile_mode,
+            )
+        except Exception:
+            if self.compile_mode:
+                log.warning("torch.compile failed — falling back without compilation")
+                return mace_mp(
+                    model=model,
+                    default_dtype=dtype,
+                    device=self.device,
+                )
+            raise
 
     def _get_calculator(self, model_id: str):
         if model_id not in self._calculators:
-            from mace.calculators import mace_mp
-
             model_url = MACE_MODELS.get(model_id, MACE_MODELS["mace-mp-0a"])["url"]
-            self._calculators[model_id] = mace_mp(
-                model=model_url, default_dtype="float32", device=self.device
+            self._calculators[model_id] = self._load_calculator(
+                model=model_url, dtype="float32"
             )
+            log.info("Loaded calculator %s on %s", model_id, self.device)
         return self._calculators[model_id]
 
     def _get_optimizer_calculator(self, model_name: str):
-        from mace.calculators import mace_mp
-
         mace_model = MODEL_MAP.get(model_name, "medium")
-        return mace_mp(model=mace_model, device=self.device, default_dtype=self.dtype)
+        return self._load_calculator(model=mace_model, dtype=self.dtype)
+
+    def device_info(self) -> dict:
+        """Return current device configuration for diagnostics."""
+        import torch
+
+        info: dict[str, Any] = {
+            "device": self.device,
+            "dtype": self.dtype,
+            "compile_mode": self.compile_mode or "off",
+            "torch_version": torch.__version__,
+            "cached_models": list(self._calculators.keys()),
+        }
+        if self.device == "cuda":
+            info["gpu_name"] = torch.cuda.get_device_name(0)
+            mem = torch.cuda.get_device_properties(0).total_mem
+            info["gpu_memory_GB"] = round(mem / 1e9, 1)
+        elif self.device == "mps":
+            info["gpu_name"] = "Apple Silicon (MPS)"
+        return info
 
     # ── Energy ────────────────────────────────────────────────────────────
 
