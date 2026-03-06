@@ -58,7 +58,7 @@ class ChatRequest(BaseModel):
     message: str = ""
     state: dict = {}
     tool_results: Optional[ToolResultsPayload] = Field(None, alias="toolResults")
-    model: str = "gpt-5-mini"
+    model: str = "claude-sonnet-4-6"
     thinking_budget: int = Field(4096, alias="thinkingBudget")
 
     model_config = {"populate_by_name": True}

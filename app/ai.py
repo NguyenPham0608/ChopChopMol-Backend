@@ -82,7 +82,7 @@ class ClaudeProvider(AIProvider):
         max_tokens: int = 16384,
     ) -> AsyncGenerator[StreamChunk, None]:
         is_opus_46 = "opus-4-6" in model
-        is_sonnet_46 = "sonnet-4-6" in model
+        is_46_model = any(x in model for x in ["opus-4-6", "sonnet-4-6"])
         supports_thinking = thinking_budget > 0 and any(
             x in model for x in ["sonnet-4", "opus-4", "haiku-4-5"]
         )
@@ -117,7 +117,7 @@ class ClaudeProvider(AIProvider):
         current_block_index = None
         block_data: dict[int, dict] = {}
 
-        if is_sonnet_46 and supports_thinking:
+        if is_46_model and supports_thinking:
             stream_ctx = self.client.beta.messages.stream(
                 betas=["interleaved-thinking-2025-05-14"],
                 **call_params,
@@ -211,11 +211,15 @@ class OpenAIProvider(AIProvider):
         thinking_budget: int = 0,
         max_tokens: int = 16384,
     ) -> AsyncGenerator[StreamChunk, None]:
-        full_messages = [{"role": "system", "content": system_prompt}] + messages
+        if system_prompt:
+            full_messages = [{"role": "system", "content": system_prompt}] + messages
+        else:
+            full_messages = messages
 
         is_o_series = any(model.startswith(p) for p in ["o3", "o4"])
         is_gpt5 = model.startswith("gpt-5")
         is_reasoning_model = is_o_series or is_gpt5
+        is_gpt54_pro = "gpt-5.4-pro" in model
 
         if thinking_budget <= 0:
             reas_effort = "none" if is_gpt5 else "low"
@@ -223,8 +227,14 @@ class OpenAIProvider(AIProvider):
             reas_effort = "low"
         elif thinking_budget <= 10000:
             reas_effort = "medium"
-        else:
+        elif thinking_budget <= 16384:
             reas_effort = "high"
+        else:
+            reas_effort = "xhigh"
+
+        # gpt-5.4-pro minimum reasoning effort is "medium"
+        if is_gpt54_pro and reas_effort in ("none", "low"):
+            reas_effort = "medium"
 
         call_params = {
             "model": model,
@@ -692,6 +702,10 @@ def _hash_state(state: dict) -> str:
         state.get("currentFileName", ""),
         state.get("activeScreenId"),
         state.get("screenCount", 1),
+        tuple(
+            (s.get("id"), s.get("atomCount", 0), s.get("frameCount", 0))
+            for s in state.get("screens", [])
+        ),
     ]
     return hashlib.md5(str(key_parts).encode()).hexdigest()
 
@@ -708,6 +722,10 @@ def _model_display_name(model: str) -> str:
         family = claude_legacy.group(2).capitalize()
         version = claude_legacy.group(1).replace("-", ".")
         return f"Claude {family} {version}"
+    elif "gpt-5.4" in model_lower:
+        return "GPT-5.4 Pro" if "pro" in model_lower else "GPT-5.4"
+    elif "gpt-5.3" in model_lower:
+        return "GPT-5.3"
     elif "gpt-5.2" in model_lower:
         return "GPT-5.2" + (" Pro" if "pro" in model_lower else "")
     elif "gpt-5.1" in model_lower:
@@ -771,9 +789,22 @@ class PromptBuilder:
 
         atom_count = state.get("atomCount", 0) if state.get("hasAtoms") else 0
 
+        # Build screens summary for multi-screen awareness
+        screens_info = state.get("screens", [])
+        screens_line = ""
+        if len(screens_info) > 1:
+            parts = []
+            for scr in screens_info:
+                marker = "*" if scr.get("active") else ""
+                file_part = f", file={scr.get('sourceFile')}" if scr.get("sourceFile") else ""
+                parts.append(
+                    f"{marker}{scr.get('title', 'Screen')}(id={scr['id']}, atoms={scr.get('atomCount', 0)}, frames={scr.get('frameCount', 0)}{file_part})"
+                )
+            screens_line = f"\nSCREENS: {', '.join(parts)}  (* = active)"
+
         return f"""ChopChopMol AI — molecular visualization and computation assistant. Powered by {model_display}.
 
-STATE: Atoms={atom_count}, Selected={selected_str}, Axis={axis_str}, Frames={state.get('frameCount', 0)}, CachedEnergies={cached_str}, File={state.get('currentFileName') or 'None'}, Folder={folder_str}, Screen={state.get('activeScreenTitle') or 'Screen 1'}({state.get('activeScreenId', 1)}), Screens={state.get('screenCount', 1)}
+STATE: Atoms={atom_count}, Selected={selected_str}, Axis={axis_str}, Frames={state.get('frameCount', 0)}, CachedEnergies={cached_str}, File={state.get('currentFileName') or 'None'}, Folder={folder_str}, Screen={state.get('activeScreenTitle') or 'Screen 1'}({state.get('activeScreenId', 1)}), Screens={state.get('screenCount', 1)}{screens_line}
 
 TOOL LAYERS (compose bottom-up):
 L1 QUERY: get_molecule_info, get_atom_info, get_bonded_atoms, measure_distance, measure_angle, measure_dihedral, get_cached_energies, web_search, read_file, list_folder_files (read-only, no side effects)
@@ -803,7 +834,7 @@ RULES:
 5. Brief responses (1-2 sentences). Execute tools immediately. Minimize tool calls — do as much as possible in a single execute_python call.
 6. Measurement tools accept atom indices directly — no need to select first.
 7. For unknown chemistry facts, use web_search. For known facts, answer directly.
-8. When user references a specific screen (by number, name, or attachment), ALWAYS call switch_screen first before operating on it. Never assume the active screen is the target.
+8. Use the screenId parameter to operate on non-active screens without switching the user's view. Only call switch_screen when the user wants to VIEW a different screen. Tools supporting screenId: calculate_energy, calculate_all_energies, optimize_geometry, run_md, get_molecule_info, get_atom_info.
 9. To load a file onto a screen, use load_file_to_screen (supports newScreen:true to create+load in one step). Use create_screen with the file param for the same effect. Always list_folder_files first if you don't know the filename.
 """
 

@@ -72,7 +72,15 @@ QUERY_TOOLS = [
     ToolDefinition(
         name="get_molecule_info",
         description="Get molecule overview: total atoms, element counts, bond count, selection. Use as first step to understand the loaded structure.",
-        parameters={"type": "object", "properties": {}},
+        parameters={
+            "type": "object",
+            "properties": {
+                "screenId": {
+                    "type": "integer",
+                    "description": "Target screen ID. Omit to use the active screen. Use to query another screen without switching the user's view.",
+                },
+            },
+        },
     ),
     ToolDefinition(
         name="get_atom_info",
@@ -84,7 +92,11 @@ QUERY_TOOLS = [
                     "type": "array",
                     "items": {"type": "integer"},
                     "description": "Atom indices (0-based)",
-                }
+                },
+                "screenId": {
+                    "type": "integer",
+                    "description": "Target screen ID. Omit to use the active screen. Use to query another screen without switching the user's view.",
+                },
             },
         },
         required=["indices"],
@@ -506,6 +518,10 @@ GENERATION_TOOLS = [
                     "type": "boolean",
                     "description": "Include per-atom forces (default: true)",
                 },
+                "screenId": {
+                    "type": "integer",
+                    "description": "Target screen ID. Omit to use the active screen. Use to operate on another screen without switching the user's view.",
+                },
             },
         },
         required=["model"],
@@ -525,6 +541,10 @@ GENERATION_TOOLS = [
                 "includeForces": {
                     "type": "boolean",
                     "description": "Include per-atom forces (default: true)",
+                },
+                "screenId": {
+                    "type": "integer",
+                    "description": "Target screen ID. Omit to use the active screen. Use to operate on another screen without switching the user's view.",
                 },
             },
         },
@@ -553,6 +573,10 @@ GENERATION_TOOLS = [
                 "includeForces": {
                     "type": "boolean",
                     "description": "Include per-atom forces (default: true)",
+                },
+                "screenId": {
+                    "type": "integer",
+                    "description": "Target screen ID. Omit to use the active screen. Use to operate on another screen without switching the user's view.",
                 },
             },
         },
@@ -591,6 +615,10 @@ GENERATION_TOOLS = [
                 "includeForces": {
                     "type": "boolean",
                     "description": "Include per-atom forces (default: true)",
+                },
+                "screenId": {
+                    "type": "integer",
+                    "description": "Target screen ID. Omit to use the active screen. Use to operate on another screen without switching the user's view.",
                 },
             },
         },
