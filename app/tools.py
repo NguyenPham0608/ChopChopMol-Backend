@@ -927,6 +927,118 @@ VIEW_TOOLS = [
 ]
 
 
+SCREEN_TOOLS = [
+    ToolDefinition(
+        name="create_screen",
+        description="Create a new screen. Optionally provide a title and/or a file path to load an .xyz molecule onto it.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "Screen title (optional)"},
+                "file": {"type": "string", "description": "File path to load onto the new screen (optional, .xyz/.extxyz only)"},
+            },
+        },
+    ),
+    ToolDefinition(
+        name="switch_screen",
+        description="Switch to a different screen by ID or 1-based index. Saves current screen state, loads target screen's molecule/camera/styles.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "id": {"type": "integer", "description": "Screen ID"},
+                "index": {"type": "integer", "description": "1-based screen index"},
+            },
+        },
+    ),
+    ToolDefinition(
+        name="duplicate_screen",
+        description="Duplicate a screen (default: active screen). Creates a copy with same molecule, camera, styles.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "id": {"type": "integer", "description": "Screen ID to duplicate (default: active)"},
+            },
+        },
+    ),
+    ToolDefinition(
+        name="delete_screen",
+        description="Delete a screen by ID (default: active screen). Cannot delete last screen.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "id": {"type": "integer", "description": "Screen ID to delete (default: active)"},
+            },
+        },
+    ),
+    ToolDefinition(
+        name="rename_screen",
+        description="Rename a screen. If no ID given, renames the active screen.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "id": {"type": "integer", "description": "Screen ID (default: active)"},
+                "title": {"type": "string", "description": "New title"},
+            },
+        },
+        required=["title"],
+    ),
+    ToolDefinition(
+        name="get_screen_list",
+        description="Get list of all screens with their IDs, titles, atom counts, and active status.",
+        parameters={"type": "object", "properties": {}},
+    ),
+    ToolDefinition(
+        name="get_screen_info",
+        description="Get detailed info about a specific screen: molecule data, camera, styles, notes.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "id": {"type": "integer", "description": "Screen ID"},
+                "index": {"type": "integer", "description": "1-based screen index"},
+            },
+        },
+    ),
+    ToolDefinition(
+        name="set_screen_notes",
+        description="Set or update markdown notes for a screen.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "id": {"type": "integer", "description": "Screen ID (default: active)"},
+                "notes": {"type": "string", "description": "Notes content (markdown)"},
+            },
+        },
+        required=["notes"],
+    ),
+    ToolDefinition(
+        name="get_screen_notes",
+        description="Read the notes content from a screen.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "id": {"type": "integer", "description": "Screen ID"},
+                "index": {"type": "integer", "description": "1-based screen index"},
+            },
+        },
+    ),
+    ToolDefinition(
+        name="load_file_to_screen",
+        description="Load an .xyz/.extxyz file from the open folder onto a screen. Can target an existing screen (by ID or index), the active screen, or create a new screen. Use list_folder_files first to find available files.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "file": {"type": "string", "description": "File path relative to open folder (e.g. 'molecule.xyz' or 'subdir/file.xyz')"},
+                "screenId": {"type": "integer", "description": "Target screen ID (optional)"},
+                "screenIndex": {"type": "integer", "description": "Target screen 1-based index (optional)"},
+                "newScreen": {"type": "boolean", "description": "If true, create a new screen for this file"},
+                "screenTitle": {"type": "string", "description": "Title for new screen (only used with newScreen:true)"},
+            },
+        },
+        required=["file"],
+    ),
+]
+
+
 def build_registry() -> ToolRegistry:
     registry = ToolRegistry()
     for group in [
@@ -936,6 +1048,7 @@ def build_registry() -> ToolRegistry:
         GENERATION_TOOLS,
         OUTPUT_TOOLS,
         VIEW_TOOLS,
+        SCREEN_TOOLS,
     ]:
         registry.register_many(group)
     return registry

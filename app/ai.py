@@ -690,6 +690,8 @@ def _hash_state(state: dict) -> str:
         state.get("hasMaceCache", False),
         state.get("maceFrameCount", 0),
         state.get("currentFileName", ""),
+        state.get("activeScreenId"),
+        state.get("screenCount", 1),
     ]
     return hashlib.md5(str(key_parts).encode()).hexdigest()
 
@@ -771,7 +773,7 @@ class PromptBuilder:
 
         return f"""ChopChopMol AI — molecular visualization and computation assistant. Powered by {model_display}.
 
-STATE: Atoms={atom_count}, Selected={selected_str}, Axis={axis_str}, Frames={state.get('frameCount', 0)}, CachedEnergies={cached_str}, File={state.get('currentFileName') or 'None'}, Folder={folder_str}
+STATE: Atoms={atom_count}, Selected={selected_str}, Axis={axis_str}, Frames={state.get('frameCount', 0)}, CachedEnergies={cached_str}, File={state.get('currentFileName') or 'None'}, Folder={folder_str}, Screen={state.get('activeScreenTitle') or 'Screen 1'}({state.get('activeScreenId', 1)}), Screens={state.get('screenCount', 1)}
 
 TOOL LAYERS (compose bottom-up):
 L1 QUERY: get_molecule_info, get_atom_info, get_bonded_atoms, measure_distance, measure_angle, measure_dihedral, get_cached_energies, web_search, read_file, list_folder_files (read-only, no side effects)
@@ -780,6 +782,7 @@ L3 EDIT: add_atom, remove_atoms, change_atom_element, set_bond_distance, set_ang
 L4 GENERATE: rotational_scan, translation_scan, angle_scan, calculate_energy, calculate_all_energies, optimize_geometry, run_md, load_molecule (create frames/data)
 L5 OUTPUT: create_chart, save_file, save_image, create_file, edit_file (present results)
 L6 VIEW: toggle_labels, toggle_force_arrows, toggle_charge_visualization, set_style, camera, undo, redo (non-destructive)
+L7 SCREEN: create_screen, switch_screen, duplicate_screen, delete_screen, rename_screen, get_screen_list, get_screen_info, set_screen_notes, get_screen_notes, load_file_to_screen (presentation screens)
 
 EXECUTE_PYTHON — auto-injected variables (no need to call other tools first):
 - atoms: list of {{element, x, y, z}} (current frame, Angstrom)
@@ -800,6 +803,8 @@ RULES:
 5. Brief responses (1-2 sentences). Execute tools immediately. Minimize tool calls — do as much as possible in a single execute_python call.
 6. Measurement tools accept atom indices directly — no need to select first.
 7. For unknown chemistry facts, use web_search. For known facts, answer directly.
+8. When user references a specific screen (by number, name, or attachment), ALWAYS call switch_screen first before operating on it. Never assume the active screen is the target.
+9. To load a file onto a screen, use load_file_to_screen (supports newScreen:true to create+load in one step). Use create_screen with the file param for the same effect. Always list_folder_files first if you don't know the filename.
 """
 
 
