@@ -202,6 +202,30 @@ class OpenAIProvider(AIProvider):
         from openai import AsyncOpenAI
         self.client = AsyncOpenAI(api_key=api_key)
 
+    def _reasoning_effort(self, model: str, thinking_budget: int) -> str:
+        is_o_series = any(model.startswith(p) for p in ["o1", "o3", "o4"])
+        is_gpt54_pro = "gpt-5.4-pro" in model
+
+        if thinking_budget <= 0:
+            effort = "none"
+        elif thinking_budget <= 4096:
+            effort = "low"
+        elif thinking_budget <= 10000:
+            effort = "medium"
+        elif thinking_budget <= 16384:
+            effort = "high"
+        else:
+            effort = "xhigh"
+
+        if is_gpt54_pro and effort in ("none", "low"):
+            effort = "medium"
+        if is_o_series:
+            if effort == "none":
+                effort = "low"
+            elif effort == "xhigh":
+                effort = "high"
+        return effort
+
     async def stream_chat(
         self,
         messages: list[dict],
@@ -211,30 +235,192 @@ class OpenAIProvider(AIProvider):
         thinking_budget: int = 0,
         max_tokens: int = 16384,
     ) -> AsyncGenerator[StreamChunk, None]:
+        is_gpt5 = model.startswith("gpt-5")
+
+        if is_gpt5:
+            async for chunk in self._stream_responses_api(
+                messages, system_prompt, tools, model, thinking_budget, max_tokens,
+            ):
+                yield chunk
+        else:
+            async for chunk in self._stream_chat_completions(
+                messages, system_prompt, tools, model, thinking_budget, max_tokens,
+            ):
+                yield chunk
+
+    # ── Responses API (GPT-5 series) ─────────────────────────────────────────
+
+    async def _stream_responses_api(
+        self,
+        messages: list[dict],
+        system_prompt: str,
+        tools: list[dict],
+        model: str,
+        thinking_budget: int,
+        max_tokens: int,
+    ) -> AsyncGenerator[StreamChunk, None]:
+        instructions, input_items = self._messages_to_responses_input(messages)
+        if system_prompt:
+            instructions = system_prompt
+
+        reas_effort = self._reasoning_effort(model, thinking_budget)
+
+        # Convert tool schemas from Chat Completions format to Responses API format
+        responses_tools = None
+        if tools:
+            responses_tools = []
+            for t in tools:
+                fn = t.get("function", t)
+                responses_tools.append({
+                    "type": "function",
+                    "name": fn["name"],
+                    "description": fn.get("description", ""),
+                    "parameters": fn.get("parameters", {}),
+                })
+
+        call_params = {
+            "model": model,
+            "input": input_items,
+            "reasoning": {"effort": reas_effort, "summary": "auto"},
+            "max_output_tokens": max_tokens,
+            "stream": True,
+        }
+        if instructions:
+            call_params["instructions"] = instructions
+        if responses_tools:
+            call_params["tools"] = responses_tools
+
+        stream = await self.client.responses.create(**call_params)
+
+        reasoning_started = False
+        # item_id -> {call_id, name, arguments}
+        tool_calls: dict[str, dict] = {}
+
+        async for event in stream:
+            et = event.type
+
+            if et == "response.output_text.delta":
+                if reasoning_started:
+                    reasoning_started = False
+                    yield StreamChunk(type="thinking_done")
+                yield StreamChunk(type="text", content=event.delta)
+
+            elif et in (
+                "response.reasoning_summary_text.delta",
+                "response.reasoning.delta",
+            ):
+                if not reasoning_started:
+                    reasoning_started = True
+                    yield StreamChunk(type="thinking_start")
+                yield StreamChunk(type="thinking", content=event.delta)
+
+            elif et == "response.output_item.added":
+                item = event.item
+                if getattr(item, "type", None) == "function_call":
+                    if reasoning_started:
+                        reasoning_started = False
+                        yield StreamChunk(type="thinking_done")
+                    item_id = getattr(item, "id", "")
+                    call_id = getattr(item, "call_id", "") or item_id
+                    name = getattr(item, "name", "")
+                    tool_calls[item_id] = {
+                        "call_id": call_id, "name": name, "arguments": "",
+                    }
+                    if name:
+                        yield StreamChunk(
+                            type="tool_use_start",
+                            tool_id=call_id,
+                            tool_name=name,
+                        )
+
+            elif et == "response.function_call_arguments.delta":
+                item_id = getattr(event, "item_id", "")
+                td = tool_calls.get(item_id)
+                if td:
+                    td["arguments"] += event.delta
+                    yield StreamChunk(
+                        type="tool_input_delta",
+                        content=event.delta,
+                        tool_id=td["call_id"],
+                        tool_name=td["name"],
+                    )
+
+            elif et == "response.function_call_arguments.done":
+                item_id = getattr(event, "item_id", "")
+                call_id = getattr(event, "call_id", "")
+                name = getattr(event, "name", "")
+                td = tool_calls.get(item_id)
+                if td:
+                    td["arguments"] = getattr(event, "arguments", td["arguments"])
+                    td["call_id"] = call_id or td["call_id"]
+                    td["name"] = name or td["name"]
+                yield StreamChunk(
+                    type="tool_use_end",
+                    tool_id=call_id,
+                    tool_name=name,
+                )
+
+            elif et == "response.completed":
+                break
+
+        if reasoning_started:
+            yield StreamChunk(type="thinking_done")
+        yield StreamChunk(type="done")
+
+    @staticmethod
+    def _messages_to_responses_input(
+        messages: list[dict],
+    ) -> tuple[str, list[dict]]:
+        """Convert Chat Completions messages to Responses API input items."""
+        instructions = ""
+        items: list[dict] = []
+
+        for msg in messages:
+            role = msg.get("role")
+            if role == "system":
+                instructions = msg.get("content", "")
+            elif role == "user":
+                items.append({"role": "user", "content": msg["content"]})
+            elif role == "assistant":
+                content = msg.get("content")
+                if content:
+                    items.append({"role": "assistant", "content": content})
+                for tc in msg.get("tool_calls", []):
+                    items.append({
+                        "type": "function_call",
+                        "call_id": tc["id"],
+                        "name": tc["function"]["name"],
+                        "arguments": tc["function"]["arguments"],
+                    })
+            elif role == "tool":
+                items.append({
+                    "type": "function_call_output",
+                    "call_id": msg["tool_call_id"],
+                    "output": msg["content"],
+                })
+
+        return instructions, items
+
+    # ── Chat Completions API (o-series, GPT-4.1, etc.) ───────────────────────
+
+    async def _stream_chat_completions(
+        self,
+        messages: list[dict],
+        system_prompt: str,
+        tools: list[dict],
+        model: str,
+        thinking_budget: int,
+        max_tokens: int,
+    ) -> AsyncGenerator[StreamChunk, None]:
         if system_prompt:
             full_messages = [{"role": "system", "content": system_prompt}] + messages
         else:
             full_messages = messages
 
-        is_o_series = any(model.startswith(p) for p in ["o3", "o4"])
-        is_gpt5 = model.startswith("gpt-5")
-        is_reasoning_model = is_o_series or is_gpt5
-        is_gpt54_pro = "gpt-5.4-pro" in model
+        is_o_series = any(model.startswith(p) for p in ["o1", "o3", "o4"])
+        is_reasoning_model = is_o_series
 
-        if thinking_budget <= 0:
-            reas_effort = "none" if is_gpt5 else "low"
-        elif thinking_budget <= 4096:
-            reas_effort = "low"
-        elif thinking_budget <= 10000:
-            reas_effort = "medium"
-        elif thinking_budget <= 16384:
-            reas_effort = "high"
-        else:
-            reas_effort = "xhigh"
-
-        # gpt-5.4-pro minimum reasoning effort is "medium"
-        if is_gpt54_pro and reas_effort in ("none", "low"):
-            reas_effort = "medium"
+        reas_effort = self._reasoning_effort(model, thinking_budget)
 
         call_params = {
             "model": model,
@@ -247,8 +433,6 @@ class OpenAIProvider(AIProvider):
         if is_reasoning_model:
             call_params["max_completion_tokens"] = max_tokens
             call_params["reasoning_effort"] = reas_effort
-            if is_gpt5:
-                call_params["verbosity"] = "low"
         else:
             call_params["max_tokens"] = max_tokens
 
@@ -260,11 +444,17 @@ class OpenAIProvider(AIProvider):
         tool_calls_data: dict[int, dict] = {}
 
         async for chunk in stream:
-            delta = chunk.choices[0].delta if chunk.choices else None
+            if not chunk.choices:
+                continue
+            choice = chunk.choices[0]
+            delta = choice.delta
             if not delta:
                 continue
 
-            reasoning_text = getattr(delta, "reasoning_content", None)
+            reasoning_text = (
+                getattr(delta, "reasoning_content", None)
+                or getattr(delta, "reasoning", None)
+            )
             if reasoning_text:
                 if not reasoning_started:
                     reasoning_started = True
@@ -306,6 +496,13 @@ class OpenAIProvider(AIProvider):
 
         if reasoning_started:
             yield StreamChunk(type="thinking_done")
+
+        for td in tool_calls_data.values():
+            yield StreamChunk(
+                type="tool_use_end",
+                tool_id=td["id"],
+                tool_name=td["name"],
+            )
 
         yield StreamChunk(type="done")
 
@@ -677,7 +874,15 @@ def prepare_history(
         repaired = repair_openai_history(history_slice)
         messages = convert_to_claude_messages(repaired)
     else:
-        messages = [{"role": "system", "content": system_prompt}] + history_slice
+        # Clean history for OpenAI: strip internal fields, fix content for tool-call-only messages
+        cleaned = []
+        for msg in history_slice:
+            m = {k: v for k, v in msg.items() if not k.startswith("_")}
+            # OpenAI requires content=null (not "") when assistant message only has tool_calls
+            if m.get("role") == "assistant" and m.get("tool_calls") and not m.get("content"):
+                m["content"] = None
+            cleaned.append(m)
+        messages = [{"role": "system", "content": system_prompt}] + cleaned
 
     return messages, is_claude
 
@@ -744,8 +949,22 @@ def _model_display_name(model: str) -> str:
             return "GPT-4.1 Nano"
         else:
             return "GPT-4.1"
-    elif model_lower.startswith("o4") or model_lower.startswith("o3"):
-        return model.upper()
+    elif model_lower.startswith("o4"):
+        if "mini" in model_lower:
+            return "o4-mini"
+        return "o4"
+    elif model_lower.startswith("o3"):
+        if "mini" in model_lower:
+            return "o3-mini"
+        if "pro" in model_lower:
+            return "o3-pro"
+        return "o3"
+    elif model_lower.startswith("o1"):
+        if "mini" in model_lower:
+            return "o1-mini"
+        if "pro" in model_lower:
+            return "o1-pro"
+        return "o1"
     return model
 
 
