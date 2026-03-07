@@ -13,7 +13,7 @@ from pydantic_settings import BaseSettings
 
 import httpx
 
-from app.ai import AgentOrchestrator, PromptBuilder, SessionStore, sse_response
+from app.ai import AgentOrchestrator, PromptBuilder, SessionStore, sse_event, sse_response
 from app.mace import MACEService
 from app.tools import build_registry
 
@@ -216,19 +216,6 @@ class ChartService:
         return {"success": True, "image": img_base64}
 
 
-# ─── MACE singleton ──────────────────────────────────────────────────────────
-
-_mace_service: MACEService | None = None
-
-
-def _get_mace(request: Request) -> MACEService:
-    global _mace_service
-    if _mace_service is None:
-        s = request.app.state.settings
-        _mace_service = MACEService(
-            device=s.mace_device, compile_mode=s.mace_compile_mode
-        )
-    return _mace_service
 
 
 # ─── Routes ───────────────────────────────────────────────────────────────────
@@ -292,7 +279,7 @@ async def calculate_energy(request: Request, body: EnergyRequest):
     if not body.atoms:
         raise HTTPException(status_code=400, detail="No atoms provided")
     try:
-        service = _get_mace(request)
+        service = request.app.state.mace_service
         return await service.calculate_energy(
             atoms_data=[a.model_dump() for a in body.atoms],
             model_id=body.model,
@@ -305,7 +292,7 @@ async def calculate_energy(request: Request, body: EnergyRequest):
 @mace_router.get("/test")
 async def test_mace(request: Request):
     try:
-        service = _get_mace(request)
+        service = request.app.state.mace_service
         return await service.test()
     except Exception as e:
         return {"error": str(e), "traceback": traceback.format_exc()}
@@ -314,7 +301,7 @@ async def test_mace(request: Request):
 @mace_router.get("/device-info")
 async def mace_device_info(request: Request):
     try:
-        service = _get_mace(request)
+        service = request.app.state.mace_service
         return service.device_info()
     except Exception as e:
         return {"error": str(e)}
@@ -325,7 +312,7 @@ async def optimize_geometry(request: Request, body: OptimizeRequest):
     if not body.atoms:
         raise HTTPException(status_code=400, detail="No atoms provided")
     try:
-        service = _get_mace(request)
+        service = request.app.state.mace_service
         return await service.optimize_geometry(
             atoms_data=[a.model_dump() for a in body.atoms],
             model_name=body.model,
@@ -342,7 +329,7 @@ async def calculate_energy_batch(request: Request, body: BatchEnergyRequest):
     if not body.frames:
         raise HTTPException(status_code=400, detail="No frames provided")
     try:
-        service = _get_mace(request)
+        service = request.app.state.mace_service
         frames_data = [[a.model_dump() for a in frame] for frame in body.frames]
         return await service.calculate_energy_batch(
             frames_data=frames_data,
@@ -358,7 +345,7 @@ async def run_md(request: Request, body: MDRequest):
     if not body.atoms:
         raise HTTPException(status_code=400, detail="No atoms provided")
     try:
-        service = _get_mace(request)
+        service = request.app.state.mace_service
         return await service.run_md(
             atoms_data=[a.model_dump() for a in body.atoms],
             model_name=body.model,
@@ -372,6 +359,48 @@ async def run_md(request: Request, body: MDRequest):
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@mace_router.post("/optimize/stream")
+async def optimize_stream(request: Request, body: OptimizeRequest):
+    if not body.atoms:
+        raise HTTPException(status_code=400, detail="No atoms provided")
+    service = request.app.state.mace_service
+
+    async def event_generator():
+        async for item in service.optimize_geometry_stream(
+            atoms_data=[a.model_dump() for a in body.atoms],
+            model_name=body.model,
+            fmax=body.fmax,
+            max_steps=body.max_steps,
+            include_forces=body.include_forces,
+        ):
+            yield sse_event(item)
+
+    return sse_response(event_generator())
+
+
+@mace_router.post("/md/stream")
+async def md_stream(request: Request, body: MDRequest):
+    if not body.atoms:
+        raise HTTPException(status_code=400, detail="No atoms provided")
+    service = request.app.state.mace_service
+
+    async def event_generator():
+        async for item in service.run_md_stream(
+            atoms_data=[a.model_dump() for a in body.atoms],
+            model_name=body.model,
+            temperature=body.temperature,
+            timestep=body.timestep,
+            friction=body.friction,
+            frames=body.frames,
+            steps=body.steps,
+            save_interval=body.save_interval,
+            include_forces=body.include_forces,
+        ):
+            yield sse_event(item)
+
+    return sse_response(event_generator())
 
 
 # Chart
@@ -543,6 +572,14 @@ async def lifespan(app: FastAPI):
     app.state.tool_registry = build_registry()
     app.state.prompt_builder = PromptBuilder()
     app.state.settings = settings
+
+    # Eagerly create and warm up MACE so first request is fast
+    mace_service = MACEService(
+        device=settings.mace_device, compile_mode=settings.mace_compile_mode
+    )
+    app.state.mace_service = mace_service
+    await asyncio.to_thread(mace_service.warmup, "mace-mp-0a")
+
     yield
 
 
