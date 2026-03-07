@@ -11,6 +11,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 
+import httpx
+
 from app.ai import AgentOrchestrator, PromptBuilder, SessionStore, sse_response
 from app.mace import MACEService
 from app.tools import build_registry
@@ -107,6 +109,24 @@ class BatchEnergyRequest(BaseModel):
     frames: list[list[AtomData]]
     model: str = "mace-mp-0a"
     include_forces: bool = Field(True, alias="includeForces")
+
+    model_config = {"populate_by_name": True}
+
+
+class WebSearchRequest(BaseModel):
+    query: str
+    search_depth: str = "basic"
+    max_results: int = 5
+    topic: str = "general"
+
+
+class PythonExecRequest(BaseModel):
+    code: str
+    description: str = ""
+    atoms: list[AtomData] = []
+    frames: list[list[AtomData]] = []
+    energies: list[float] = []
+    frame_infos: list[dict] = Field(default_factory=list, alias="frameInfos")
 
     model_config = {"populate_by_name": True}
 
@@ -217,6 +237,8 @@ health_router = APIRouter(tags=["health"])
 chat_router = APIRouter(prefix="/ai", tags=["chat"])
 mace_router = APIRouter(prefix="/ai/mace", tags=["mace"])
 chart_router = APIRouter(prefix="/ai", tags=["chart"])
+search_router = APIRouter(prefix="/ai", tags=["search"])
+python_router = APIRouter(prefix="/ai", tags=["python"])
 
 _chart_service = ChartService()
 
@@ -361,6 +383,153 @@ async def generate_chart(body: dict):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ─── Web Search ──────────────────────────────────────────────────────────────
+
+
+@search_router.post("/web-search")
+async def web_search(request: Request, body: WebSearchRequest):
+    settings: Settings = request.app.state.settings
+    api_key = settings.tavily_api_key
+    if not api_key:
+        raise HTTPException(status_code=500, detail="Web search not configured (TAVILY_API_KEY missing)")
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                "https://api.tavily.com/search",
+                json={
+                    "api_key": api_key,
+                    "query": body.query,
+                    "search_depth": body.search_depth,
+                    "max_results": min(body.max_results, 10),
+                    "topic": body.topic,
+                    "include_answer": True,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        return {
+            "answer": data.get("answer", ""),
+            "results": [
+                {"title": r.get("title", ""), "url": r.get("url", ""), "content": r.get("content", "")}
+                for r in data.get("results", [])
+            ],
+        }
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=e.response.status_code, detail=f"Search API error: {e.response.text}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─── Python Execution ────────────────────────────────────────────────────────
+
+
+@python_router.post("/python")
+async def execute_python(request: Request, body: PythonExecRequest):
+    try:
+        result = await asyncio.to_thread(_run_python_sync, body)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _run_python_sync(body: PythonExecRequest) -> dict:
+    import io
+    import contextlib
+
+    import numpy as np
+
+    # Build injected variables
+    atoms = [{"element": a.element, "x": a.x, "y": a.y, "z": a.z} for a in body.atoms]
+
+    # Build positions array (n_frames, n_atoms, 3)
+    if body.frames:
+        positions = np.array([
+            [[a.x, a.y, a.z] for a in frame]
+            for frame in body.frames
+        ], dtype=np.float64)
+    elif atoms:
+        positions = np.array([[[a["x"], a["y"], a["z"]] for a in atoms]], dtype=np.float64)
+    else:
+        positions = np.empty((0, 0, 3), dtype=np.float64)
+
+    energies = np.array(body.energies, dtype=np.float64) if body.energies else np.array([], dtype=np.float64)
+
+    # Build frames list with metadata
+    frames_list = []
+    for i, frame_atoms in enumerate(body.frames or []):
+        frame_data = {
+            "index": i,
+            "atoms": [{"element": a.element, "x": a.x, "y": a.y, "z": a.z} for a in frame_atoms],
+        }
+        if i < len(body.frame_infos):
+            frame_data.update(body.frame_infos[i])
+        frames_list.append(frame_data)
+
+    # Extract MD arrays from frame_infos
+    steps = np.array([fi.get("step", i) for i, fi in enumerate(body.frame_infos)], dtype=np.float64) if body.frame_infos else np.array([], dtype=np.float64)
+    temperatures = np.array([fi.get("temperature", 0) for fi in body.frame_infos], dtype=np.float64) if body.frame_infos else np.array([], dtype=np.float64)
+
+    # Namespace for exec
+    import math
+    namespace = {
+        "atoms": atoms,
+        "positions": positions,
+        "energies": energies,
+        "frames": frames_list,
+        "steps": steps,
+        "temperatures": temperatures,
+        "np": np,
+        "math": math,
+        "__builtins__": __builtins__,
+    }
+
+    # Try importing optional libs
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        namespace["plt"] = plt
+    except ImportError:
+        pass
+
+    try:
+        import scipy
+        namespace["scipy"] = scipy
+    except ImportError:
+        pass
+
+    # Capture stdout
+    stdout_buf = io.StringIO()
+    figures = []
+
+    try:
+        with contextlib.redirect_stdout(stdout_buf):
+            exec(body.code, namespace)
+
+        # Capture any matplotlib figures
+        try:
+            import matplotlib.pyplot as plt
+            for fig_num in plt.get_fignums():
+                fig = plt.figure(fig_num)
+                buf = io.BytesIO()
+                fig.savefig(buf, format="png", facecolor=fig.get_facecolor() or "#1a1a2e", edgecolor="none", dpi=100, bbox_inches="tight")
+                buf.seek(0)
+                figures.append(base64.b64encode(buf.read()).decode("utf-8"))
+            plt.close("all")
+        except Exception:
+            pass
+
+        stdout_text = stdout_buf.getvalue()
+        # Truncate if too long
+        if len(stdout_text) > 50000:
+            stdout_text = stdout_text[:50000] + "\n... [output truncated]"
+
+        return {"stdout": stdout_text, "figures": figures}
+
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}", "stdout": stdout_buf.getvalue(), "figures": figures}
+
+
 # ─── App Factory ──────────────────────────────────────────────────────────────
 
 
@@ -398,6 +567,8 @@ def create_app() -> FastAPI:
     app.include_router(chat_router)
     app.include_router(mace_router)
     app.include_router(chart_router)
+    app.include_router(search_router)
+    app.include_router(python_router)
 
     return app
 

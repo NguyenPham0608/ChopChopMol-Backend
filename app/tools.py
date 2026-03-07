@@ -158,25 +158,46 @@ QUERY_TOOLS = [
         },
     ),
     ToolDefinition(
+        name="get_frame_info",
+        description="Get metadata for a trajectory frame (energy, forces, temperature, etc.). Defaults to current frame.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "frameIndex": {
+                    "type": "integer",
+                    "description": "Frame index (0-based). Defaults to current frame.",
+                },
+            },
+        },
+    ),
+    ToolDefinition(
         name="get_cached_energies",
         description="Retrieve cached energy results from last calculate_all_energies/optimize_geometry/run_md. Avoids recalculation. Follow with create_chart.",
         parameters={"type": "object", "properties": {}},
     ),
     ToolDefinition(
         name="read_file",
-        description="Read text content of a file in the open folder.",
+        description="Read text content of a file in the open folder. Use a path relative to the folder root.",
         parameters={
             "type": "object",
             "properties": {
-                "filename": {"type": "string", "description": "Filename to read"}
+                "path": {"type": "string", "description": "File path relative to the open folder (e.g. 'data.xyz' or 'subdir/file.txt')"}
             },
         },
-        required=["filename"],
+        required=["path"],
     ),
     ToolDefinition(
         name="list_folder_files",
-        description="List all files in the currently open folder.",
-        parameters={"type": "object", "properties": {}},
+        description="List files and subdirectories in the open folder. Optionally specify a subdirectory path.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Subdirectory path relative to the open folder root (optional, default: root)",
+                },
+            },
+        },
     ),
     ToolDefinition(
         name="web_search",
@@ -1067,6 +1088,101 @@ SCREEN_TOOLS = [
 ]
 
 
+TRAJECTORY_TOOLS = [
+    ToolDefinition(
+        name="go_to_frame",
+        description="Navigate to a specific trajectory frame by index.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "index": {
+                    "type": "integer",
+                    "description": "Frame index (0-based)",
+                },
+            },
+        },
+        required=["index"],
+    ),
+    ToolDefinition(
+        name="play_trajectory",
+        description="Start trajectory playback animation.",
+        parameters={"type": "object", "properties": {}},
+    ),
+    ToolDefinition(
+        name="pause_trajectory",
+        description="Pause trajectory playback.",
+        parameters={"type": "object", "properties": {}},
+    ),
+    ToolDefinition(
+        name="step_forward",
+        description="Advance trajectory by one frame.",
+        parameters={"type": "object", "properties": {}},
+    ),
+    ToolDefinition(
+        name="step_back",
+        description="Go back one trajectory frame.",
+        parameters={"type": "object", "properties": {}},
+    ),
+    ToolDefinition(
+        name="set_playback_speed",
+        description="Set trajectory playback speed. Lower delay = faster.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "delay": {
+                    "type": "integer",
+                    "description": "Delay between frames in milliseconds (1-1000, default: 50)",
+                },
+            },
+        },
+        required=["delay"],
+    ),
+    ToolDefinition(
+        name="set_playback_mode",
+        description="Set trajectory playback mode.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": ["loop", "bounce"],
+                    "description": "loop = restart at end, bounce = reverse at ends",
+                },
+            },
+        },
+        required=["mode"],
+    ),
+    ToolDefinition(
+        name="load_xyz",
+        description="Load molecule from XYZ-format text string. Use to build molecules programmatically or load AI-generated structures.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "xyzText": {
+                    "type": "string",
+                    "description": "XYZ file content as text string",
+                },
+                "filename": {
+                    "type": "string",
+                    "description": "Display name (default: ai_generated.xyz)",
+                },
+            },
+        },
+        required=["xyzText"],
+    ),
+    ToolDefinition(
+        name="get_xyz",
+        description="Export current molecule geometry as XYZ-format text string. Useful for inspecting or saving coordinates.",
+        parameters={"type": "object", "properties": {}},
+    ),
+    ToolDefinition(
+        name="toggle_frame_info",
+        description="Show/hide the frame info panel that displays per-frame metadata (energy, temperature, etc.).",
+        parameters={"type": "object", "properties": {}},
+    ),
+]
+
+
 def build_registry() -> ToolRegistry:
     registry = ToolRegistry()
     for group in [
@@ -1076,6 +1192,7 @@ def build_registry() -> ToolRegistry:
         GENERATION_TOOLS,
         OUTPUT_TOOLS,
         VIEW_TOOLS,
+        TRAJECTORY_TOOLS,
         SCREEN_TOOLS,
     ]:
         registry.register_many(group)

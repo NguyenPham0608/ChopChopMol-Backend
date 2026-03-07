@@ -1,10 +1,37 @@
 import asyncio
+import io
 import logging
+import sys
+import threading
+import warnings
 from typing import Any
 
 import numpy as np
 
 log = logging.getLogger(__name__)
+
+# Suppress noisy but harmless warnings from e3nn/torch
+warnings.filterwarnings("ignore", message=".*TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD.*")
+
+
+class _SuppressMACEOutput:
+    """Context manager to suppress MACE's print() and root logging.warning() noise.
+
+    MACE uses raw print() for info messages (cuequivariance, float32 notices)
+    and logging.warning() on the root logger for dtype mismatch.
+    These are harmless and clutter the terminal.
+    """
+
+    def __enter__(self):
+        self._stdout = sys.stdout
+        sys.stdout = io.StringIO()
+        self._root_level = logging.root.level
+        logging.root.setLevel(logging.ERROR)
+        return self
+
+    def __exit__(self, *exc):
+        sys.stdout = self._stdout
+        logging.root.setLevel(self._root_level)
 
 
 def _detect_device() -> tuple[str, str]:
@@ -78,6 +105,7 @@ class MACEService:
 
     def __init__(self, device: str = "", compile_mode: str = ""):
         self._calculators: dict[str, Any] = {}
+        self._lock = threading.Lock()  # Prevent concurrent MPS/GPU access
         detected_device, detected_dtype = _detect_device()
         self.device = device or detected_device
         self.dtype = "float32" if self.device == "mps" else detected_dtype
@@ -91,34 +119,35 @@ class MACEService:
         """Load a MACE calculator, handling MPS float64→float32 conversion."""
         from mace.calculators import mace_mp
 
-        if self.device == "mps":
-            # MPS cannot handle float64 tensors — load on CPU then transfer.
-            # MACE's ScaleShiftMACE.forward() also hardcodes .double() for
-            # per-atom energy; we monkey-patch that to .float() on MPS.
-            calc = mace_mp(model=model, default_dtype="float32", device="cpu")
-            import torch
-            for m in calc.models:
-                m.float().to(torch.device("mps"))
-            calc.device = "mps"
-            _patch_mps_double(calc)
-            return calc
+        with _SuppressMACEOutput():
+            if self.device == "mps":
+                # MPS cannot handle float64 tensors — load on CPU then transfer.
+                # MACE's ScaleShiftMACE.forward() also hardcodes .double() for
+                # per-atom energy; we monkey-patch that to .float() on MPS.
+                calc = mace_mp(model=model, default_dtype="float32", device="cpu")
+                import torch
+                for m in calc.models:
+                    m.float().to(torch.device("mps"))
+                calc.device = "mps"
+                _patch_mps_double(calc)
+                return calc
 
-        try:
-            return mace_mp(
-                model=model,
-                default_dtype=dtype,
-                device=self.device,
-                compile_mode=self.compile_mode,
-            )
-        except Exception:
-            if self.compile_mode:
-                log.warning("torch.compile failed — falling back without compilation")
+            try:
                 return mace_mp(
                     model=model,
                     default_dtype=dtype,
                     device=self.device,
+                    compile_mode=self.compile_mode,
                 )
-            raise
+            except Exception:
+                if self.compile_mode:
+                    log.warning("torch.compile failed — falling back without compilation")
+                    return mace_mp(
+                        model=model,
+                        default_dtype=dtype,
+                        device=self.device,
+                    )
+                raise
 
     def _get_calculator(self, model_id: str):
         if model_id not in self._calculators:
@@ -130,8 +159,14 @@ class MACEService:
         return self._calculators[model_id]
 
     def _get_optimizer_calculator(self, model_name: str):
-        mace_model = MODEL_MAP.get(model_name, "medium")
-        return self._load_calculator(model=mace_model, dtype=self.dtype)
+        cache_key = f"opt:{model_name}"
+        if cache_key not in self._calculators:
+            mace_model = MODEL_MAP.get(model_name, "medium")
+            self._calculators[cache_key] = self._load_calculator(
+                model=mace_model, dtype=self.dtype
+            )
+            log.info("Loaded optimizer calculator %s on %s", model_name, self.device)
+        return self._calculators[cache_key]
 
     def device_info(self) -> dict:
         """Return current device configuration for diagnostics."""
@@ -166,22 +201,23 @@ class MACEService:
     ) -> dict:
         from ase import Atoms
 
-        symbols = [a["element"] for a in atoms_data]
-        positions = [[a["x"], a["y"], a["z"]] for a in atoms_data]
-        atoms = Atoms(symbols=symbols, positions=positions)
-        atoms.calc = self._get_calculator(model_id)
+        with self._lock:
+            symbols = [a["element"] for a in atoms_data]
+            positions = [[a["x"], a["y"], a["z"]] for a in atoms_data]
+            atoms = Atoms(symbols=symbols, positions=positions)
+            atoms.calc = self._get_calculator(model_id)
 
-        energy = float(atoms.get_potential_energy())
-        result = {
-            "success": True,
-            "energy_eV": energy,
-            "energy_kcal": energy * 23.0609,
-        }
-        if include_forces:
-            forces = atoms.get_forces().tolist()
-            result["forces"] = forces
-            result["max_force"] = float(np.max(np.linalg.norm(forces, axis=1)))
-        return result
+            energy = float(atoms.get_potential_energy())
+            result = {
+                "success": True,
+                "energy_eV": energy,
+                "energy_kcal": energy * 23.0609,
+            }
+            if include_forces:
+                forces = atoms.get_forces().tolist()
+                result["forces"] = forces
+                result["max_force"] = float(np.max(np.linalg.norm(forces, axis=1)))
+            return result
 
     # ── Batch Energy ──────────────────────────────────────────────────────
 
@@ -197,45 +233,46 @@ class MACEService:
     ) -> dict:
         from ase import Atoms
 
-        calc = self._get_calculator(model_id)
-        results = []
+        with self._lock:
+            calc = self._get_calculator(model_id)
+            results = []
 
-        first_frame = frames_data[0]
-        symbols = [a["element"] for a in first_frame]
-        positions = [[a["x"], a["y"], a["z"]] for a in first_frame]
-        atoms = Atoms(symbols=symbols, positions=positions)
-        atoms.calc = calc
+            first_frame = frames_data[0]
+            symbols = [a["element"] for a in first_frame]
+            positions = [[a["x"], a["y"], a["z"]] for a in first_frame]
+            atoms = Atoms(symbols=symbols, positions=positions)
+            atoms.calc = calc
 
-        for i, atoms_data in enumerate(frames_data):
-            positions = [[a["x"], a["y"], a["z"]] for a in atoms_data]
-            atoms.set_positions(positions)
+            for i, atoms_data in enumerate(frames_data):
+                positions = [[a["x"], a["y"], a["z"]] for a in atoms_data]
+                atoms.set_positions(positions)
 
-            energy = float(atoms.get_potential_energy())
-            forces = atoms.get_forces()
-            max_force = float(np.max(np.linalg.norm(forces, axis=1)))
+                energy = float(atoms.get_potential_energy())
+                forces = atoms.get_forces()
+                max_force = float(np.max(np.linalg.norm(forces, axis=1)))
 
-            frame_result = {
-                "frame": i,
-                "energy_eV": round(energy, 6),
-                "energy_kcal": round(energy * 23.0609, 4),
-                "max_force_eV_A": round(max_force, 6),
+                frame_result = {
+                    "frame": i,
+                    "energy_eV": round(energy, 6),
+                    "energy_kcal": round(energy * 23.0609, 4),
+                    "max_force_eV_A": round(max_force, 6),
+                }
+                if include_forces:
+                    frame_result["forces"] = forces.tolist()
+                results.append(frame_result)
+
+            energies = [r["energy_eV"] for r in results]
+            min_idx = int(np.argmin(energies))
+            max_idx = int(np.argmax(energies))
+
+            return {
+                "success": True,
+                "frameCount": len(results),
+                "energies": results,
+                "lowestEnergyFrame": min_idx,
+                "highestEnergyFrame": max_idx,
+                "energyRange_eV": round(max(energies) - min(energies), 6),
             }
-            if include_forces:
-                frame_result["forces"] = forces.tolist()
-            results.append(frame_result)
-
-        energies = [r["energy_eV"] for r in results]
-        min_idx = int(np.argmin(energies))
-        max_idx = int(np.argmax(energies))
-
-        return {
-            "success": True,
-            "frameCount": len(results),
-            "energies": results,
-            "lowestEnergyFrame": min_idx,
-            "highestEnergyFrame": max_idx,
-            "energyRange_eV": round(max(energies) - min(energies), 6),
-        }
 
     # ── Optimize ──────────────────────────────────────────────────────────
 
@@ -262,54 +299,55 @@ class MACEService:
         from ase import Atoms
         from ase.optimize import BFGS
 
-        symbols = [a["element"] for a in atoms_data]
-        positions = np.array([[a["x"], a["y"], a["z"]] for a in atoms_data])
+        with self._lock:
+            symbols = [a["element"] for a in atoms_data]
+            positions = np.array([[a["x"], a["y"], a["z"]] for a in atoms_data])
 
-        pos_min = positions.min(axis=0) if len(positions) > 0 else np.zeros(3)
-        pos_max = positions.max(axis=0) if len(positions) > 0 else np.full(3, 10.0)
-        cell_size = np.maximum(pos_max - pos_min + 20.0, 30.0)
+            pos_min = positions.min(axis=0) if len(positions) > 0 else np.zeros(3)
+            pos_max = positions.max(axis=0) if len(positions) > 0 else np.full(3, 10.0)
+            cell_size = np.maximum(pos_max - pos_min + 20.0, 30.0)
 
-        atoms = Atoms(symbols=symbols, positions=positions, cell=cell_size, pbc=False)
-        atoms.calc = self._get_optimizer_calculator(model_name)
+            atoms = Atoms(symbols=symbols, positions=positions, cell=cell_size, pbc=False)
+            atoms.calc = self._get_optimizer_calculator(model_name)
 
-        trajectory_frames = []
+            trajectory_frames = []
 
-        def observer():
-            pos = atoms.get_positions().copy()
-            energy = float(atoms.get_potential_energy())
+            def observer():
+                pos = atoms.get_positions().copy()
+                energy = float(atoms.get_potential_energy())
+                forces = atoms.get_forces()
+                max_f = float(np.sqrt((forces**2).sum(axis=1).max()))
+                frame = {"positions": pos.tolist(), "energy_eV": energy, "max_force": max_f}
+                if include_forces:
+                    frame["forces"] = forces.tolist()
+                trajectory_frames.append(frame)
+
+            opt = BFGS(atoms, logfile=None, trajectory=None, restart=None)
+            opt.attach(observer, interval=1)
+            opt.run(fmax=fmax, steps=max_steps)
+
             forces = atoms.get_forces()
-            max_f = float(np.sqrt((forces**2).sum(axis=1).max()))
-            frame = {"positions": pos.tolist(), "energy_eV": energy, "max_force": max_f}
+            max_force = np.sqrt((forces**2).sum(axis=1).max())
+            converged = bool(max_force < fmax)
+            final_positions = atoms.get_positions().tolist()
+            final_energy = float(atoms.get_potential_energy())
+
+            result = {
+                "success": True,
+                "converged": converged,
+                "steps": int(opt.nsteps),
+                "energy_eV": final_energy,
+                "energy_kcal": final_energy * 23.0609,
+                "max_force": float(max_force),
+                "positions": [
+                    {"index": i, "x": p[0], "y": p[1], "z": p[2]}
+                    for i, p in enumerate(final_positions)
+                ],
+                "trajectory": trajectory_frames,
+            }
             if include_forces:
-                frame["forces"] = forces.tolist()
-            trajectory_frames.append(frame)
-
-        opt = BFGS(atoms, logfile=None, trajectory=None, restart=None)
-        opt.attach(observer, interval=1)
-        opt.run(fmax=fmax, steps=max_steps)
-
-        forces = atoms.get_forces()
-        max_force = np.sqrt((forces**2).sum(axis=1).max())
-        converged = bool(max_force < fmax)
-        final_positions = atoms.get_positions().tolist()
-        final_energy = float(atoms.get_potential_energy())
-
-        result = {
-            "success": True,
-            "converged": converged,
-            "steps": int(opt.nsteps),
-            "energy_eV": final_energy,
-            "energy_kcal": final_energy * 23.0609,
-            "max_force": float(max_force),
-            "positions": [
-                {"index": i, "x": p[0], "y": p[1], "z": p[2]}
-                for i, p in enumerate(final_positions)
-            ],
-            "trajectory": trajectory_frames,
-        }
-        if include_forces:
-            result["forces"] = forces.tolist()
-        return result
+                result["forces"] = forces.tolist()
+            return result
 
     # ── Molecular Dynamics ────────────────────────────────────────────────
 
@@ -354,79 +392,80 @@ class MACEService:
         from ase.md.langevin import Langevin
         from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
 
-        if requested_frames and requested_frames >= 2:
-            n_steps = (requested_frames - 1) * save_interval
-        elif requested_frames == 1:
-            save_interval = 1
-            n_steps = 0
-        else:
-            n_steps = steps
+        with self._lock:
+            if requested_frames and requested_frames >= 2:
+                n_steps = (requested_frames - 1) * save_interval
+            elif requested_frames == 1:
+                save_interval = 1
+                n_steps = 0
+            else:
+                n_steps = steps
 
-        symbols = [a["element"] for a in atoms_data]
-        positions = np.array([[a["x"], a["y"], a["z"]] for a in atoms_data])
+            symbols = [a["element"] for a in atoms_data]
+            positions = np.array([[a["x"], a["y"], a["z"]] for a in atoms_data])
 
-        pos_min = positions.min(axis=0) if len(positions) > 0 else np.zeros(3)
-        pos_max = positions.max(axis=0) if len(positions) > 0 else np.full(3, 10.0)
-        cell_size = np.maximum(pos_max - pos_min + 20.0, 30.0)
+            pos_min = positions.min(axis=0) if len(positions) > 0 else np.zeros(3)
+            pos_max = positions.max(axis=0) if len(positions) > 0 else np.full(3, 10.0)
+            cell_size = np.maximum(pos_max - pos_min + 20.0, 30.0)
 
-        atoms = Atoms(symbols=symbols, positions=positions, cell=cell_size, pbc=False)
-        atoms.calc = self._get_optimizer_calculator(model_name)
+            atoms = Atoms(symbols=symbols, positions=positions, cell=cell_size, pbc=False)
+            atoms.calc = self._get_optimizer_calculator(model_name)
 
-        MaxwellBoltzmannDistribution(atoms, temperature_K=temperature)
+            MaxwellBoltzmannDistribution(atoms, temperature_K=temperature)
 
-        trajectory_frames = []
+            trajectory_frames = []
 
-        def observer():
-            pos = atoms.get_positions().copy()
-            energy = float(atoms.get_potential_energy())
-            kinetic = float(atoms.get_kinetic_energy())
-            temp = float(kinetic / (1.5 * len(atoms) * units.kB))
-            frame = {
-                "positions": pos.tolist(),
-                "energy_eV": energy,
-                "kinetic_eV": kinetic,
-                "total_eV": energy + kinetic,
-                "temperature_K": temp,
-                "step": len(trajectory_frames) * save_interval,
+            def observer():
+                pos = atoms.get_positions().copy()
+                energy = float(atoms.get_potential_energy())
+                kinetic = float(atoms.get_kinetic_energy())
+                temp = float(kinetic / (1.5 * len(atoms) * units.kB))
+                frame = {
+                    "positions": pos.tolist(),
+                    "energy_eV": energy,
+                    "kinetic_eV": kinetic,
+                    "total_eV": energy + kinetic,
+                    "temperature_K": temp,
+                    "step": len(trajectory_frames) * save_interval,
+                }
+                if include_forces:
+                    forces = atoms.get_forces()
+                    frame["forces"] = forces.tolist()
+                    frame["max_force"] = float(np.max(np.linalg.norm(forces, axis=1)))
+                trajectory_frames.append(frame)
+
+            dyn = Langevin(
+                atoms,
+                timestep=timestep * units.fs,
+                temperature_K=temperature,
+                friction=friction / units.fs,
+            )
+            dyn.attach(observer, interval=save_interval)
+            observer()  # Capture initial frame
+            dyn.run(n_steps)
+
+            final_positions = atoms.get_positions().tolist()
+            final_energy = float(atoms.get_potential_energy())
+
+            result = {
+                "success": True,
+                "steps": n_steps,
+                "temperature_K": temperature,
+                "timestep_fs": timestep,
+                "energy_eV": final_energy,
+                "energy_kcal": final_energy * 23.0609,
+                "frameCount": len(trajectory_frames),
+                "positions": [
+                    {"index": i, "x": p[0], "y": p[1], "z": p[2]}
+                    for i, p in enumerate(final_positions)
+                ],
+                "trajectory": trajectory_frames,
             }
             if include_forces:
                 forces = atoms.get_forces()
-                frame["forces"] = forces.tolist()
-                frame["max_force"] = float(np.max(np.linalg.norm(forces, axis=1)))
-            trajectory_frames.append(frame)
-
-        dyn = Langevin(
-            atoms,
-            timestep=timestep * units.fs,
-            temperature_K=temperature,
-            friction=friction / units.fs,
-        )
-        dyn.attach(observer, interval=save_interval)
-        observer()  # Capture initial frame
-        dyn.run(n_steps)
-
-        final_positions = atoms.get_positions().tolist()
-        final_energy = float(atoms.get_potential_energy())
-
-        result = {
-            "success": True,
-            "steps": n_steps,
-            "temperature_K": temperature,
-            "timestep_fs": timestep,
-            "energy_eV": final_energy,
-            "energy_kcal": final_energy * 23.0609,
-            "frameCount": len(trajectory_frames),
-            "positions": [
-                {"index": i, "x": p[0], "y": p[1], "z": p[2]}
-                for i, p in enumerate(final_positions)
-            ],
-            "trajectory": trajectory_frames,
-        }
-        if include_forces:
-            forces = atoms.get_forces()
-            result["forces"] = forces.tolist()
-            result["max_force"] = float(np.max(np.linalg.norm(forces, axis=1)))
-        return result
+                result["forces"] = forces.tolist()
+                result["max_force"] = float(np.max(np.linalg.norm(forces, axis=1)))
+            return result
 
     # ── Test ──────────────────────────────────────────────────────────────
 

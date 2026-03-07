@@ -11,3 +11,5 @@ mace-torch
 ase
 numpy
 matplotlib
+cuequivariance; platform_machine == "x86_64"
+cuequivariance-torch; platform_machine == "x86_64"
